@@ -596,12 +596,67 @@ def search_documents(query: str, max_results: int = 5) -> List[Dict[str, Any] | 
 
         faiss_docs = _faiss_search(query, max_results)
 
-        sqlite_fts5_docs = 
-       
+        sqlite_docs = _sqlite_fts5_search(query, max_results=max_results)
+
+        if "error" in sqlite_docs:
+            sqlite_docs = _sqlite_fallback_search(query, max_results)
+
 
         all_docs = {}
 
+        #process faiss results
+        for idx, doc in enumerate(faiss_docs):
+            key = doc["file_path"]
+            all_docs[key] = {
+                **doc,
+                "vector_rank": idx+1,
+                "sql_rank": None,
+                "combined_score": 0
+            }
 
+        #process sqlite results
+        for idx, doc in enumerate(sqlite_docs):
+            key = doc["file_path"]
+
+            if key in all_docs:
+                all_docs[key]["sql_rank"] = idx + 1
+            else:
+                all_docs[key] = {
+                    "file_path": key,
+                    "score": doc["metadata_score"],
+                    "source": "sql",
+                    "vector_rank": None,
+                    "sql_rank": idx + 1,
+                    "combined_score": 0
+                }
+
+        #Calculating Reciprocal Rank Fusion scores
+        rrf_k = 60
+        
+        for doc in all_docs.values():
+            
+            vector_rrf = 1 / (rrf_k + doc["vector_rank"]) if doc["vector_rank"] else 0
+
+            sql_rrf = 1 / (rrf_k + doc["sql_rank"]) if doc["sql_rank"] else 0
+
+            doc["combined_score"] = vector_rrf + sql_rrf
+
+        sorted_results = sorted(all_docs.values(),
+                                key=lambda x: x["combined_score"],
+                                reverse=True)[:max_results]
+
+        results = []
+
+        for doc in sorted_results:
+            results.append({
+                "file_path": doc.get("file_path"),
+                "combined_score": doc.get("combined_score")
+            })
+
+        return results 
+    
+    except Exception as e:
+        return [{"error": f"There was an error running search_documents function: {str(e)}"}]
 
 
 
