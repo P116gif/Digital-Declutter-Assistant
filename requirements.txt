@@ -3,3 +3,4 @@ langchain-ollama
 langgraph
 send2trash
 requests
+nltk

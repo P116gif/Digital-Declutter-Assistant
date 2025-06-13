@@ -37,12 +37,6 @@ def _move_file(source: str, destination: str) -> str:
         new_filename = f"{base}_{count}{ext}"
         new_destination = os.path.join(destination, new_filename)
         count += 1
-    
-    print(destination)
-    print(new_destination)
-    print(base, ext)
-    print(filename)
-    print(source)
 
     shutil.move(source, new_destination)
     
