@@ -1,0 +1,5 @@
+langchain
+langchain-ollama
+langgraph
+send2trash
+requests
