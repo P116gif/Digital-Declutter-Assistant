@@ -76,17 +76,27 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.prebuilt import tools_condition, ToolNode
 from langgraph.graph.message import add_messages
 
-class State(TypedDict):
 
+class State(TypedDict):
+    """
+        This state ensures the messages don't override each other and instead are appended into an ever increasing context to be passed to the llm
+    """
     messages: Annotated[list, add_messages]
 
 
+#creating a tool node using _move_file func
 tool_node = ToolNode(tools=tools)
 
+
+#the chatbot itself
 def chatbot(state: State):
+    """
+        The chatbot function that calls the llm and returns the messages
+    """
     return {"messages": [llm_with_tool.invoke(state["messages"])]}
 
 
+#building the graph
 graph_builder = StateGraph(State)
 
 graph_builder.add_node("chatbot", chatbot)
@@ -99,15 +109,23 @@ graph_builder.add_conditional_edges(
 )
 graph_builder.add_edge("tools", "chatbot")
 
+
 graph = graph_builder.compile()
 
+
 def stream_graph_updates(user_input: str):
+    """
+        This function streams the AI output onto the terminal where you're running it
+    """
     for event in graph.stream({"messages": [{"role": "user", "content": user_input}]}):
         for value in event.values():
             print("Assistant:", value["messages"][-1].content)
 
-while True:
-        
+
+"""
+ The entry point of this file which runs the graph
+"""
+while True:      
     user_input = input("User: ")
     if user_input.lower() in ["quit", "exit", "q"]:
         print("Goodbye!")
