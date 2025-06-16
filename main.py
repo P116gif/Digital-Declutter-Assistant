@@ -1,11 +1,12 @@
 import shutil 
 import os 
-import json 
 import sqlite3 
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Annotated 
-from uuid import uuid4
+from uuid_utils import uuid7
+import filetype 
 
+import nltk
 from nltk.corpus import stopwords, wordnet
 from nltk.tokenize import word_tokenize
 
@@ -13,15 +14,16 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
 from langchain_core.tools import tool 
+from langchain.load.dump import dumps 
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_ollama import ChatOllama
+from langchain_ollama import ChatOllama, OllamaEmbeddings
+from langchain_groq import ChatGroq
 from langchain_community.document_loaders import (
 
-    PyPdfLoader,
+    PyPDFLoader,
     TextLoader,
     Docx2txtLoader
 )
-from langchain_community.embeddings import OllamaEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
@@ -31,12 +33,13 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.prebuilt import tools_condition, ToolNode
 from langgraph.graph.message import add_messages
 
-try:
-    import filetype
-except ImportError:
-    print("Installing filetype library")
-    os.system("uv pip install filetype")
-    import filetype 
+
+load_dotenv()
+
+llm = ChatGroq(
+        model = "qwen/qwen3-32b",
+        temperature=0,
+        )
 
 class DocumentClassification(BaseModel):
     """Structure for document classification output"""
@@ -49,7 +52,7 @@ class DocumentClassification(BaseModel):
     keywords: List[str] = Field(description="Important keywords for search indexing")
 
 
-def init_search_databse():
+def init_search_database():
     """Initialise SQLite databse for document search index"""
     conn = sqlite3.connect('document_search_index.db')
     cursor = conn.cursor()
@@ -59,7 +62,8 @@ def init_search_databse():
 
         CREATE TABLE IF NOT EXISTS documents(
 
-            doc_id INTEGER PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            doc_id TEXT UNIQUE,
             file_path TEXT UNIQUE,
             file_name TEXT,
             file_type TEXT,
@@ -70,7 +74,7 @@ def init_search_databse():
             summary TEXT,
             keywords TEXT,
             entities TEXT,
-            created_at TIMESTAMP,
+            created_at TEXT,
             content_preview TEXT       
         )
     ''')
@@ -78,6 +82,7 @@ def init_search_databse():
     #Create Full Text Search 5 (FTS5) table for faster searching when finding matches
     cursor.execute('''
         CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
+            doc_id,
             content_preview,
             keywords,
             entities,
@@ -85,31 +90,31 @@ def init_search_databse():
             classification,
             subcategory,
             content='documents',
-            content_rowid='doc_id'
+            content_rowid='id'
         )
     ''')
 
     #Create triggers to keep FTS5 table synchronized
     cursor.execute('''
         CREATE TRIGGER IF NOT EXISTS documents_ai AFTER INSERT ON documents BEGIN
-            INSERT INTO documents_fts(rowid, content_preview, keywords, entities, summary, classification, subcategory)
-            VALUES (new.doc_id, new.content_preview, new.keywords, new.entities, new.summary, new.classification, new.subcategory);
+            INSERT INTO documents_fts(rowid, doc_id, content_preview, keywords, entities, summary, classification, subcategory)
+            VALUES (new.id, new.doc_id, new.content_preview, new.keywords, new.entities, new.summary, new.classification, new.subcategory);
         END;
     ''')
 
     cursor.execute('''
         CREATE TRIGGER IF NOT EXISTS documents_ad AFTER DELETE ON documents BEGIN
-            INSERT INTO documents_fts(documents_fts, rowid, content_preview, keywords, entities, summary, classification, subcategory)
-            VALUES('delete', old.doc_id, old.content_preview, old.keywords, old.entities, old.summary, old.classification, old.subcategory);
+            INSERT INTO documents_fts(documents_fts, rowid, doc_id, content_preview, keywords, entities, summary, classification, subcategory)
+            VALUES('delete', old.id, old.doc_id, old.content_preview, old.keywords, old.entities, old.summary, old.classification, old.subcategory);
         END;
     ''')
 
     cursor.execute('''
         CREATE TRIGGER IF NOT EXISTS documents_au AFTER UPDATE ON documents BEGIN
-            INSERT INTO documents_fts(documents_fts, rowid, content_preview, keywords, entities, summary, classification, subcategory)
-            VALUES('delete', old.doc_id, old.content_preview, old.keywords, old.entities, old.summary, old.classification, old.subcategory);
-            INSERT INTO documents_fts(rowid, content_preview, keywords, entities, summary, classification, subcategory)
-            VALUES (new.doc_id, new.content_preview, new.keywords, new.entities, new.summary, new.classification, new.subcategory);
+            INSERT INTO documents_fts(documents_fts, rowid, doc_id, content_preview, keywords, entities, summary, classification, subcategory)
+            VALUES('delete', old.id, old.doc_id, old.content_preview, old.keywords, old.entities, old.summary, old.classification, old.subcategory);
+            INSERT INTO documents_fts(rowid, doc_id, content_preview, keywords, entities, summary, classification, subcategory)
+            VALUES (new.id, new.doc_id, new.content_preview, new.keywords, new.entities, new.summary, new.classification, new.subcategory);
         END;
     ''')
 
@@ -140,11 +145,12 @@ def detect_file_type(file_path: str) -> str:
 
 
 @tool
-def extract_document_content(file_path: str) -> str:
+def extract_document_content(file_type: str, file_path: str) -> str:
     """
         Extract text content from various document types.
 
         Arguments:
+            file_type: the type of the file 
             file_path: Path to the document to extract content from
 
         Returns:
@@ -152,10 +158,9 @@ def extract_document_content(file_path: str) -> str:
     """
 
     try:
-        file_type = detect_file_type(file_path)
 
         if file_type == 'pdf':
-            loader = PyPdfLoader(file_path)
+            loader = PyPdfLoader(file_path) #type: ignore
             pages = loader.load()
             content = "\n\n".join([page.page_content for page in pages])
         elif file_type in ['docx', 'doc']:
@@ -188,12 +193,6 @@ def classify_document_content(file_path: str, content: str) -> Dict[str, Any]:
 
     try:
 
-        llm = ChatOllama(
-            model = "qwen3",
-            temperatute = 0,
-            base_url = "http://localhost:11434",
-        )
-
         structured_llm = llm.with_structured_output(DocumentClassification)
 
         classification_prompt = ChatPromptTemplate.from_template("""
@@ -222,13 +221,13 @@ def classify_document_content(file_path: str, content: str) -> Dict[str, Any]:
         classification_dict = {
             
             "file_path": file_path,
-            "classification": result.classification,
-            "subcategory": result.subcategory,
-            "confidence_score": result.confidence_score,
-            "suggested_location": result.suggested_location,
-            "identitfied entities": result.identified_entities,
-            "summary": result.summary,
-            "keywords": result.keywords
+            "classification": result.classification, #type: ignore
+            "subcategory": result.subcategory, #type: ignore
+            "confidence_score": result.confidence_score, #type: ignore
+            "suggested_location": result.suggested_location, #type: ignore
+            "identitfied entities": result.identified_entities, #type: ignore
+            "summary": result.summary, #type: ignore
+            "keywords": result.keywords #type: ignore
         }
 
         return classification_dict
@@ -238,12 +237,14 @@ def classify_document_content(file_path: str, content: str) -> Dict[str, Any]:
     
 
 @tool 
-def create_search_index_entry(classification_result: Dict[str, Any], content: str) -> str:
+def create_search_index_entry(file_path: str, file_type: str, classification_result: Dict[str, Any], content: str) -> str:
     """
         Create a search index entry for the proccessed document.
 
         Arguments:
-            classification_result: Classification documents from classify_document_content
+            file_path: A string containing the source of the file
+            file_type: A string containting the type of file
+            classification_result: Classification of the document received from classify_document_content
             content: original document content
         
         Returns:
@@ -252,7 +253,7 @@ def create_search_index_entry(classification_result: Dict[str, Any], content: st
 
     try:
 
-        doc_id = str(uuid4())
+        doc_id = uuid7()
         
         embeddings = OllamaEmbeddings(
             model = "snowflake-arctic-embed2:568m",
@@ -302,7 +303,7 @@ def create_search_index_entry(classification_result: Dict[str, Any], content: st
 
         
         try:
-            conn = sqlite3.connect("document_search_index.db")
+            conn = sqlite3.connect('document_search_index.db')
             cursor = conn.cursor()
 
             cursor.execute(''' 
@@ -314,18 +315,18 @@ def create_search_index_entry(classification_result: Dict[str, Any], content: st
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''',(
 
-                doc_id,
-                classification_result.get("file_path", ""),
-                os.path.basename(classification_result.get("file_path","")),
-                detect_file_type(classification_result.get("file_path", "")),
+                str(doc_id),
+                file_path,
+                str(os.path.basename(file_path)),
+                file_type,
                 classification_result.get("classification", ""),
                 classification_result.get("subcategory", ""),
-                classification_result.get('confidence_score', 0.0),
+                float(classification_result.get('confidence_score', 0.0)),
                 classification_result.get('suggested_location', ''),
                 classification_result.get('summary', ''),
                 ', '.join(classification_result.get('keywords', [])),
                 ', '.join(classification_result.get('identified_entities', [])),
-                datetime.now().isoformat(),
+                str(datetime.now().isoformat()),
                 content[:500]
             ))
 
@@ -380,26 +381,36 @@ def move_file_to_suggested_location(file_path: str, suggested_location: str) -> 
 
 def _extract_keywords_and_synonyms(query: str) -> List[str]:
 
-    stop_words = set(stopwords.words("english"))
-    words= word_tokenize(query)
+    
+    stop_words = set(stopwords.words('english'))
+
+    #nltk.download('stopwords')
+    #nltk.download('punkt_tab')
+    #nltk.download('punkt')
+
+    words = word_tokenize(query)
+
     
     keywords = [w for w in words if w.lower() not in stop_words and w.isalnum()]
-    synonms = set(keywords)
+    
+    synonyms = set(keywords)
     max_synonyms_per_word = 3
 
+    #nltk.download('wordnet')
     for kw in keywords:
         count = 0
         for syn in wordnet.synsets(kw):
-            for lemma in syn.lemmas():
-                if lemma.name() != kw:
-                    synonms.add(lemma.name)
+            for lemma in syn.lemmas(): #type: ignore
+                lemma_name = lemma.name().lower().replace('_', ' ') 
+                if lemma_name != kw.lower():
+                    synonyms.add(lemma_name)
                     count += 1
                     if count >= max_synonyms_per_word:
                         break
             if count >= max_synonyms_per_word:
                 break
     
-    return list(synonms)
+    return list(synonyms)
 
 
 def _faiss_search(query: str, max_results: int = 5) -> List[Dict[str, Any]]:
@@ -426,20 +437,20 @@ def _faiss_search(query: str, max_results: int = 5) -> List[Dict[str, Any]]:
         vectorstore_dir = "document_vectorstore"
 
         if not os.path.exists(vectorstore_dir):
-            return ["No documents indexed yet. Please process some documents first"]
+            return [{"error": "No documents indexed yet. Please process some documents first"}]
         
         vectorStore = FAISS.load_local(vectorstore_dir, embeddings, allow_dangerous_deserialization=True)
         
         faiss_results = vectorStore.similarity_search_with_score(query, k=max_results)
         faiss_docs = [{
 
-            "file_path": doc.metadata["file_path"],
-            "file_id": doc.metadata["doc_id"],
+            "doc_id": doc.metadata["doc_id"],
             "score": float(score),
             "source": "vector"
 
         }for doc, score in faiss_results] 
 
+        
         return faiss_docs
     
     except Exception as e:
@@ -499,7 +510,7 @@ def _sqlite_fallback_search(query: str, max_results: int = 5) -> List[Dict[Any, 
 
         cursor.execute(sql, params)
         sqlite_results = [dict(zip([col[0] for col in cursor.description], row)) for row in cursor.fetchall()]
-
+        print("Fallback\n ", sqlite_results)
         return sqlite_results
      
     except Exception as e:
@@ -509,7 +520,7 @@ def _sqlite_fallback_search(query: str, max_results: int = 5) -> List[Dict[Any, 
         conn.close()
 
 
-def _sqlite_fts5_search(query: str, search_type: str ="basic", max_results: int = 5) -> List[Dict[Any, Any]]:
+def _sqlite_fts5_search(query: str, max_results: int = 5) -> List[Dict[Any, Any]]:
     """
         Helper function to complete an advanced fts function and different search types.
 
@@ -524,21 +535,14 @@ def _sqlite_fts5_search(query: str, search_type: str ="basic", max_results: int 
     
     """
     try:
+        
         conn = sqlite3.connect("document_search_index.db")
+       
         cursor = conn.cursor()
+ 
 
-        if search_type == "phrase":
-            fts_query = f'"{query}"'
-        elif search_type == "boolean":
-            fts_query = query
-        elif search_type == "prefix":
-            #prefix matching
-            keywords = _extract_keywords_and_synonyms(query)
-            fts_query = ' OR '.join([f'{keyword}*' for keyword in keywords])
-        else:
-            #basic
-            keywords = _extract_keywords_and_synonyms(query)
-            fts_query = ' OR '.join(keywords)
+        keywords = _extract_keywords_and_synonyms(query)
+        fts_query = ' OR '.join(keywords)
 
         sql = """
 
@@ -552,7 +556,7 @@ def _sqlite_fts5_search(query: str, search_type: str ="basic", max_results: int 
                 
                 ) AS combined_score
                 FROM documents d
-                JOIN documents_fts fts ON d.doc_id = fts.rowid
+                JOIN documents_fts fts ON d.doc_id = fts.doc_id
                 WHERE documents_fts MATCH ?
                 ORDER BY combined_score DESC, d.confidence_score DESC
                 LIMIT ?
@@ -563,6 +567,7 @@ def _sqlite_fts5_search(query: str, search_type: str ="basic", max_results: int 
         try:
             cursor.execute(sql, params)
             sqlite_results = [dict(zip([col[0] for col in cursor.description], row)) for row in cursor.fetchall()]
+            
             return sqlite_results
         
         finally:
@@ -583,15 +588,14 @@ def search_documents(query: str, max_results: int = 5) -> List[Dict[str, Any] | 
     """
         Hybrid search combining semantic similarity and SQLite metadata / keyword search
 
-        Args:
+        Arguments:
             query: Search Query
-            max_results: Maximum numbe of results to return
+            max_results: Maximum number of results to return
 
         Returns:
             results: List of matching documents with combined relevance score
     """
 
-    conn = None
     try:
 
         faiss_docs = _faiss_search(query, max_results)
@@ -606,24 +610,28 @@ def search_documents(query: str, max_results: int = 5) -> List[Dict[str, Any] | 
 
         #process faiss results
         for idx, doc in enumerate(faiss_docs):
-            key = doc["file_path"]
+            key = doc.get('doc_id')
+            
             all_docs[key] = {
                 **doc,
                 "vector_rank": idx+1,
                 "sql_rank": None,
+                "file_path": None,
                 "combined_score": 0
             }
 
         #process sqlite results
         for idx, doc in enumerate(sqlite_docs):
-            key = doc["file_path"]
+            key = doc["doc_id"]
 
             if key in all_docs:
                 all_docs[key]["sql_rank"] = idx + 1
+                all_docs[key]["file_path"] = doc["suggested_location"]
             else:
                 all_docs[key] = {
-                    "file_path": key,
-                    "score": doc["metadata_score"],
+                    "doc_id": key,
+                    "file_path": doc["suggested_location"],
+                    "score": doc["confidence_score"],
                     "source": "sql",
                     "vector_rank": None,
                     "sql_rank": idx + 1,
@@ -637,8 +645,11 @@ def search_documents(query: str, max_results: int = 5) -> List[Dict[str, Any] | 
             
             vector_rrf = 1 / (rrf_k + doc["vector_rank"]) if doc["vector_rank"] else 0
 
+            print(vector_rrf, end = " ")
+
             sql_rrf = 1 / (rrf_k + doc["sql_rank"]) if doc["sql_rank"] else 0
 
+            print(sql_rrf, end = " ")
             doc["combined_score"] = vector_rrf + sql_rrf
 
         sorted_results = sorted(all_docs.values(),
@@ -649,6 +660,7 @@ def search_documents(query: str, max_results: int = 5) -> List[Dict[str, Any] | 
 
         for doc in sorted_results:
             results.append({
+                "doc_id": doc.get("doc_id"),
                 "file_path": doc.get("file_path"),
                 "combined_score": doc.get("combined_score")
             })
@@ -661,20 +673,106 @@ def search_documents(query: str, max_results: int = 5) -> List[Dict[str, Any] | 
 
 
 class DocumentAnalysisState(TypedDict):
+    """State for langgraph agent """
+    messages: Annotated[list, add_messages]
+    file_path: Optional[str]
+    content: Optional[str]
+    classfication_result: Optional[Dict[str, Any]]
+    analysis_complete: bool
 
+# Initialize tools
+tools = [
+    detect_file_type,
+    extract_document_content,
+    classify_document_content,
+    create_search_index_entry,
+    move_file_to_suggested_location,
+    search_documents
+]
 
+llm_with_tools = llm.bind_tools(tools)
+
+# Create tool node
+tool_node = ToolNode(tools=tools)
 
 def document_analyser_agent(state: DocumentAnalysisState):
     """Main document analysis agent"""
     return {"messages": [llm_with_tools.invoke(state["messages"])]}
 
 
-def analyse_document(file_path: str) -> Dict[str, Any]:
+graph_builder = StateGraph(DocumentAnalysisState)
 
+graph_builder.add_node("agent", document_analyser_agent)
+graph_builder.add_node("tools", tool_node)
+
+graph_builder.add_edge(START, "agent")
+graph_builder.add_conditional_edges(
+    "agent",
+    tools_condition,
+    {"tools":"tools", END:END}
+)
+graph_builder.add_edge("tools", "agent")
+
+graph = graph_builder.compile()
+
+def analyse_document(file_path: str) -> Dict[str, Any]:
+    """
+    Complete the entire document analysis workflow
+
+    Arguments:
+        file_path: the source location of the file to be analysed
+
+    Returns:
+        analysis_result: complete analysis including classification and indexing
+    """
+
+    user_message = f""" 
+    
+    Please analyze the document at: {file_path}
+    
+    Follow these steps:
+    1. Find the file type of the document
+    2. Extract the document content  
+    3. Classify the document content and extract key information
+    4. ALWAYS create a search index entry for the document
+    5. Provide the classification result in the specified JSON format
+    6. FINALLY, Move the file to the suggested location using the move_file tool
+    
+    The final output should be in this JSON format:
+    {{
+        "classification": "Primary category",
+        "subcategory": "Specific subcategory", 
+        "confidence_score": 0.95,
+        "suggested_location": "/Documents/Category/Subcategory/",
+        "identified_entities": ["entity1", "entity2", "entity3"]
+    }}    
+    """
+
+    try:
+
+        #initialise the db
+        init_search_database()
+
+        result = graph.invoke({
+            "messages": [{"role": "user", "content": user_message}],
+            "file_path": file_path,
+            "content": None,
+            "classification_result": None,
+            "analysis_complete": False
+        })
+
+        return {"status": "success", "messages": result["messages"]}
+    except Exception as e:
+        return {"error": f"Error occured when running analyse document {str(e)}"}
+    
 
 
 def stream_graph_updates(user_input: str):
-
+    """Stream AI output to terminal"""
+    for event in graph.stream({"messages": [{"role": "user", "content": user_input}]}):
+        for value in event.values():
+            if "messages" in value and value["messages"]:
+                print("Assistant:", value["messages"][-1].content)
 
 
 if __name__ == "__main__":
@@ -684,7 +782,7 @@ if __name__ == "__main__":
     print("- quit: Exit the program")
 
 
-    init_search_databse()
+    init_search_database()
 
     while True:
         user_input = input("\nUser: ")
@@ -697,7 +795,6 @@ if __name__ == "__main__":
             if os.path.exists(file_path):
                 print(f"Analysing Document: {file_path}")
                 result = analyse_document(file_path)
-                print(json.dumps(result, indent=2))
             else:
                 print(f"File not found: {file_path}")
 
