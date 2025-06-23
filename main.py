@@ -5,8 +5,8 @@ from datetime import datetime
 from typing import Dict, Any, List, Optional, Annotated 
 from uuid_utils import uuid7
 import filetype 
+import requests
 
-import nltk
 from nltk.corpus import stopwords, wordnet
 from nltk.tokenize import word_tokenize
 
@@ -14,14 +14,11 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
 from langchain_core.tools import tool 
-from langchain.load.dump import dumps 
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langchain_groq import ChatGroq
 from langchain_community.document_loaders import (
-
     PyPDFLoader,
-    TextLoader,
     Docx2txtLoader
 )
 from langchain_community.vectorstores import FAISS
@@ -147,7 +144,7 @@ def detect_file_type(file_path: str) -> str:
 @tool
 def extract_document_content(file_type: str, file_path: str) -> str:
     """
-        Extract text content from various document types.
+        NOT FOR IMAGE FILES. Extract text content from text document types, i.e. from .pdf, .docx, .doc and .txt
 
         Arguments:
             file_type: the type of the file 
@@ -160,7 +157,7 @@ def extract_document_content(file_type: str, file_path: str) -> str:
     try:
 
         if file_type == 'pdf':
-            loader = PyPdfLoader(file_path) #type: ignore
+            loader = PyPDFLoader(file_path) #type: ignore
             pages = loader.load()
             content = "\n\n".join([page.page_content for page in pages])
         elif file_type in ['docx', 'doc']:
@@ -178,9 +175,115 @@ def extract_document_content(file_type: str, file_path: str) -> str:
 
 
 @tool
+def extract_and_classify_image_content(image_path: str) -> Dict[str, Any]:
+    """
+        This function extracts the contents of an image, i.e., files of type .png, .jpg, .jpeg and then classifies them
+
+        Arguments:
+            file_path: the path to the image
+
+        Returns:
+            classification: a dictionary with the classification output
+    """
+    
+    prompt = """
+
+        Analyze this image by sending a *get* request to the required url and provide structured JSON output with:
+        1. Primary category (medical, financial, games, personal, education, legal, technical, unknown)
+        2. Identify a subcategory within the primary category
+        3. Provide a confidence score between [0-1] for your classification
+        4. Suggested location to move the file to (format: /Pictures/{PrimaryCategory}/{Subcategory}/...)
+            [*ALWAYS* Ensure that the folder structure starts with 'Pictures']
+        5. Identify key entities in the image 
+        6. Provide a brief summary of the image
+        7. Identify important keywords that will be included in search queries for the image
+        
+        Guidelines:
+        - Use 'unknown' category only if confidence < 0.4
+        - Include dates in YYYY-MM-DD format when found
+    """
+#UPLOAD IMAGE
+
+    url = "http://localhost:8000/upload"
+    _, ext = os.path.splitext(image_path)
+    
+
+    # Determine MIME type
+    if ext in [".jpg", ".jpeg"]:
+        mime_type = "image/jpeg"
+    elif ext == ".png":
+        mime_type = "image/png"
+    else:
+        raise ValueError(f"Unsupported file type: {ext}")
+    
+    # Upload file to docker
+    with open(image_path, "rb") as f:
+        files = {"file": (os.path.basename(image_path), f, mime_type)}
+        response = requests.post(url, files=files)
+    
+    # Handle upload errors
+    if response.status_code != 200:
+        raise Exception(f"Upload failed: {response.text}")
+    
+    #GET THE IMAGE ID AND JWT TOKEN
+    image_id = response.json()["image_id"]
+    print(image_id)
+    token = response.json()["token"]
+    print(token)
+    #CREATE ENDPOINT URLS FOR REQ
+    image_url = f"http://localhost:8000/image/{image_id}?token={token}"
+
+    #CREATE AI MESSAGE
+    message = [
+        {   
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": prompt,
+                },
+                {
+                    "type":"image_url",
+                    "image_url": {"url": image_url, "detail": "auto"}
+                }
+                
+            ]
+        }
+    ]
+
+    image_llm = ChatGroq(
+        model = "meta-llama/llama-4-scout-17b-16e-instruct",
+        temperature = 0.2
+    )
+
+    llm.with_structured_output(DocumentClassification)
+
+    #CALL AI
+    result = image_llm.invoke(message)
+
+    classification = {
+
+            "file_path": image_path,
+            "classification": result.classification, #type: ignore
+            "subcategory": result.subcategory, #type: ignore
+            "confidence_score": result.confidence_score, #type: ignore
+            "suggested_location": result.suggested_location, #type: ignore
+            "identitfied entities": result.identified_entities, #type: ignore
+            "summary": result.summary, #type: ignore
+            "keywords": result.keywords #type: ignore
+    }
+
+    requests.post(image_url, headers=headers)
+    return classification
+
+    
+
+    
+
+@tool
 def classify_document_content(file_path: str, content: str) -> Dict[str, Any]:
     """
-        Classify document context and extract keyword information using the llm
+        Classify text document context and extract keyword information using the llm
 
         Arguments:
             file_path: Path to the original file
@@ -207,11 +310,15 @@ def classify_document_content(file_path: str, content: str) -> Dict[str, Any]:
             2. Identifying a specific subcategory within that classification
             3. Providing a confidence score (0.0-1.0) for your classification
             4. Suggesting an appropriate folder structure for organization
+                [ALWAYS Ensure that the folder structure starts with one of these two directories: 'Documents' OR 'Downloads']
             5. Extracting key entities, dates, amounts, names, or important information
             6. Creating a brief summary
             7. Identifying important keywords for search
 
             Focus on accuracy and provide practical organizational suggestions.
+            Guidelines:
+                - Use 'unknown' category only if confidence < 0.4
+                - Include dates in YYYY-MM-DD format when found
         """)
 
         result = structured_llm.invoke(
@@ -273,7 +380,7 @@ def create_search_index_entry(file_path: str, file_type: str, classification_res
         for i,_ in enumerate(texts):
             chunk_meta = {
                 **classification_result,
-                "doc_id": doc_id,
+                "doc_id": str(doc_id),
                 "chunk_index": i,
                 "total_chunks": len(texts)
             }
@@ -282,7 +389,7 @@ def create_search_index_entry(file_path: str, file_type: str, classification_res
         vectorStore_dir = "document_vectorstore"
 
         if not os.path.exists(vectorStore_dir):
-
+            print("Creating directory")
             #create a new vectorstore
             vectorstore = FAISS.from_texts(
                 texts,
@@ -359,6 +466,12 @@ def move_file_to_suggested_location(file_path: str, suggested_location: str) -> 
 
     try:
         # Create destination directory if it doesn't exist
+        
+        append = str(os.environ.get("MAIN_DIRECTORY"))
+
+        if append not in suggested_location:
+            suggested_location = append + suggested_location
+
         os.makedirs(suggested_location, exist_ok=True)
         
         filename = os.path.basename(file_path)
@@ -645,11 +758,8 @@ def search_documents(query: str, max_results: int = 5) -> List[Dict[str, Any] | 
             
             vector_rrf = 1 / (rrf_k + doc["vector_rank"]) if doc["vector_rank"] else 0
 
-            print(vector_rrf, end = " ")
-
             sql_rrf = 1 / (rrf_k + doc["sql_rank"]) if doc["sql_rank"] else 0
 
-            print(sql_rrf, end = " ")
             doc["combined_score"] = vector_rrf + sql_rrf
 
         sorted_results = sorted(all_docs.values(),
@@ -687,7 +797,8 @@ tools = [
     classify_document_content,
     create_search_index_entry,
     move_file_to_suggested_location,
-    search_documents
+    search_documents,
+    extract_and_classify_image_content
 ]
 
 llm_with_tools = llm.bind_tools(tools)
@@ -779,7 +890,8 @@ if __name__ == "__main__":
     print("Document Understanding Agent Initialised!")
     print("Commands: ")
     print("- analyse <file_path>: Analyse a specific document")
-    print("- quit: Exit the program")
+    print("- search <query>: To search for something in the database + vectorstore")
+    print("- quit / exit / q: Exit the program")
 
 
     init_search_database()
@@ -797,7 +909,6 @@ if __name__ == "__main__":
                 result = analyse_document(file_path)
             else:
                 print(f"File not found: {file_path}")
-
         elif user_input.startswith("search "):
             query = user_input[7:].strip()
             print(f"Searching for: {query}")
