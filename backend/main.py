@@ -5,7 +5,9 @@ from datetime import datetime
 from typing import Dict, Any, List, Optional, Annotated 
 from uuid_utils import uuid7
 import filetype 
+
 import requests
+from pyngrok import ngrok 
 
 from nltk.corpus import stopwords, wordnet
 from nltk.tokenize import word_tokenize
@@ -15,8 +17,9 @@ from pydantic import BaseModel, Field
 
 from langchain_core.tools import tool 
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_ollama import ChatOllama, OllamaEmbeddings
+from langchain_ollama import OllamaEmbeddings
 from langchain_groq import ChatGroq
+from langchain_openai import ChatOpenAI
 from langchain_community.document_loaders import (
     PyPDFLoader,
     Docx2txtLoader
@@ -207,7 +210,7 @@ def extract_and_classify_image_content(image_path: str) -> Dict[str, Any]:
 
 #UPLOAD IMAGE
 
-    url = "https://934c-106-51-247-158.ngrok-free.app"
+    url = ngrok.connect(8000)
 
     upload_url = f"{url}/upload"
     _, ext = os.path.splitext(image_path)
@@ -236,6 +239,7 @@ def extract_and_classify_image_content(image_path: str) -> Dict[str, Any]:
 
     #CREATE ENDPOINT URLS FOR REQ
     image_url = f"{url}/image/{image_id}?token={token}"
+
 
     image_llm = ChatGroq(
         model = "meta-llama/llama-4-maverick-17b-128e-instruct",
